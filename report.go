@@ -15,8 +15,8 @@ func footer() *embedFooter {
 	return &embedFooter{Text: fmt.Sprintf("pingcord %s @ %s", version, host)}
 }
 
-func startupPayload(cfg *Config) webhookPayload {
-	return webhookPayload{Embeds: []embed{{
+func startupPayload(cfg *Config) message {
+	return message{Embeds: []embed{{
 		Title:       "ℹ️ pingcord 起動",
 		Description: fmt.Sprintf("監視対象 %d 件 / deadman %d 件 の監視を開始しました。", len(cfg.Targets), len(cfg.Deadman)),
 		Color:       colorBlue,
@@ -25,8 +25,8 @@ func startupPayload(cfg *Config) webhookPayload {
 	}}}
 }
 
-func shutdownPayload() webhookPayload {
-	return webhookPayload{Embeds: []embed{{
+func shutdownPayload() message {
+	return message{Embeds: []embed{{
 		Title:       "⚠️ pingcord 停止",
 		Description: "監視プロセスが停止しました。意図しない停止であればコンテナの状態を確認してください。",
 		Color:       colorOrange,
@@ -35,8 +35,8 @@ func shutdownPayload() webhookPayload {
 	}}}
 }
 
-func testPayload(cfg *Config) webhookPayload {
-	p := webhookPayload{Embeds: []embed{{
+func testPayload(cfg *Config) message {
+	p := message{Embeds: []embed{{
 		Title:       "🧪 pingcord テスト通知",
 		Description: "Webhook の設定は正常です。DOWN 時のメンションは本文に付与されます。",
 		Color:       colorBlue,
@@ -49,9 +49,9 @@ func testPayload(cfg *Config) webhookPayload {
 	return p
 }
 
-// summaryPayload は全監視対象の現在の状態をまとめた定期レポート。
-// 毎日届くことで「pingcord 自体が生きている」ことの確認 (Watchdog) にもなる。
-func summaryPayload(statuses []TargetStatus) webhookPayload {
+// statusPayload は全監視対象の現在の状態をまとめる (定期レポートと /status で使う)。
+// 定期レポートは毎日届くことで「pingcord 自体が生きている」ことの確認 (Watchdog) にもなる。
+func statusPayload(statuses []TargetStatus, title string) message {
 	var up, unknown int
 	var down []string
 	for _, s := range statuses {
@@ -63,6 +63,9 @@ func summaryPayload(statuses []TargetStatus) webhookPayload {
 			if s.DownSince != nil {
 				line += fmt.Sprintf(" — <t:%d:R> から", s.DownSince.Unix())
 			}
+			if s.AckedBy != "" {
+				line += " ✋ " + s.AckedBy
+			}
 			down = append(down, line)
 		default:
 			unknown++
@@ -70,7 +73,7 @@ func summaryPayload(statuses []TargetStatus) webhookPayload {
 	}
 
 	e := embed{
-		Title:     "📊 定期レポート",
+		Title:     title,
 		Color:     colorGreen,
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
 		Footer:    footer(),
@@ -83,7 +86,7 @@ func summaryPayload(statuses []TargetStatus) webhookPayload {
 		e.Color = colorGrey
 	}
 	e.Description = desc
-	return webhookPayload{Embeds: []embed{e}}
+	return message{Embeds: []embed{e}}
 }
 
 // nextSummary は times ("HH:MM") のうち now より後で最も近い時刻を返す。
@@ -102,7 +105,7 @@ func nextSummary(now time.Time, times []string) time.Time {
 	return next
 }
 
-func runSummary(ctx context.Context, times []string, snapshot func() []TargetStatus, post func(webhookPayload)) {
+func runSummary(ctx context.Context, times []string, snapshot func() []TargetStatus, post func(message)) {
 	for {
 		next := nextSummary(time.Now(), times)
 		slog.Debug("next summary scheduled", "at", next)
@@ -110,7 +113,7 @@ func runSummary(ctx context.Context, times []string, snapshot func() []TargetSta
 		case <-ctx.Done():
 			return
 		case <-time.After(time.Until(next)):
-			post(summaryPayload(snapshot()))
+			post(statusPayload(snapshot(), "📊 定期レポート"))
 		}
 	}
 }

@@ -29,12 +29,23 @@ const (
 	shutdownGrace = 8 * time.Second
 )
 
-type webhookPayload struct {
-	Content         string           `json:"content,omitempty"`
-	Username        string           `json:"username,omitempty"`
-	AvatarURL       string           `json:"avatar_url,omitempty"`
-	Embeds          []embed          `json:"embeds,omitempty"`
-	AllowedMentions *allowedMentions `json:"allowed_mentions,omitempty"`
+// message は送信するメッセージ。Webhook / Bot どちらの送信方式でも共通で使う。
+type message struct {
+	Content string
+	Embeds  []embed
+	// Bot モード用: ack ボタンを付ける DOWN / STILL DOWN と、ボタンを閉じる復旧済みの対象
+	alerts    []alertRef
+	recovered []string
+}
+
+type alertRef struct {
+	name      string
+	downSince int64
+}
+
+// transport は 1 回分の送信を行う。retryAfter が 0 以外ならその時間待ってから再送する。
+type transport interface {
+	send(ctx context.Context, m message) (retryAfter time.Duration, err error)
 }
 
 type embed struct {
@@ -60,27 +71,33 @@ type allowedMentions struct {
 	Parse []string `json:"parse"`
 }
 
+type webhookBody struct {
+	Content         string           `json:"content,omitempty"`
+	Username        string           `json:"username,omitempty"`
+	AvatarURL       string           `json:"avatar_url,omitempty"`
+	Embeds          []embed          `json:"embeds,omitempty"`
+	AllowedMentions *allowedMentions `json:"allowed_mentions,omitempty"`
+}
+
 // queued はイベント (まとめて送る) か、そのまま送るメッセージのどちらか。
 type queued struct {
 	event   *Event
-	payload *webhookPayload
+	payload *message
 }
 
 // Notifier は Discord への送信を 1 goroutine に集約し、順序を保ったまま
 // group_wait の間に発生したイベントを 1 メッセージにまとめて送る。
 type Notifier struct {
-	cfg       DiscordConfig
+	tr        transport
 	groupWait time.Duration
-	client    *http.Client
 	queue     chan queued
 	done      chan struct{}
 }
 
-func NewNotifier(cfg DiscordConfig, groupWait time.Duration) *Notifier {
+func NewNotifier(tr transport, groupWait time.Duration) *Notifier {
 	return &Notifier{
-		cfg:       cfg,
+		tr:        tr,
 		groupWait: groupWait,
-		client:    &http.Client{Timeout: 15 * time.Second},
 		queue:     make(chan queued, 1024),
 		done:      make(chan struct{}),
 	}
@@ -88,7 +105,7 @@ func NewNotifier(cfg DiscordConfig, groupWait time.Duration) *Notifier {
 
 func (n *Notifier) Notify(ev Event) { n.enqueue(queued{event: &ev}) }
 
-func (n *Notifier) Post(p webhookPayload) { n.enqueue(queued{payload: &p}) }
+func (n *Notifier) Post(p message) { n.enqueue(queued{payload: &p}) }
 
 func (n *Notifier) enqueue(q queued) {
 	select {
@@ -163,13 +180,18 @@ func (n *Notifier) flush(ctx context.Context, pending *[]Event) {
 	}
 }
 
-func eventsPayload(events []Event) webhookPayload {
-	var p webhookPayload
+func eventsPayload(events []Event) message {
+	var p message
 	var mentions []string
 	counts := map[EventKind]int{}
 	for _, ev := range events {
 		counts[ev.Kind]++
 		p.Embeds = append(p.Embeds, eventEmbed(ev))
+		if ev.Kind == EventRecovered {
+			p.recovered = append(p.recovered, ev.Name)
+		} else {
+			p.alerts = append(p.alerts, alertRef{name: ev.Name, downSince: ev.DownSince.Unix()})
+		}
 		if ev.Kind != EventRecovered && ev.Mention != "" && !slices.Contains(mentions, ev.Mention) {
 			mentions = append(mentions, ev.Mention)
 		}
@@ -224,6 +246,9 @@ func eventEmbed(ev Event) embed {
 		if ev.RTT > 0 {
 			e.Fields = append(e.Fields, embedField{Name: "応答時間", Value: ev.RTT.Round(10 * time.Microsecond).String(), Inline: true})
 		}
+		if ev.AckedBy != "" {
+			e.Fields = append(e.Fields, embedField{Name: "Ack", Value: ev.AckedBy, Inline: true})
+		}
 		return e
 	}
 	if ev.Err != "" {
@@ -233,19 +258,11 @@ func eventEmbed(ev Event) embed {
 }
 
 // Send は Discord にメッセージを送る。429 や 5xx、通信エラーの場合はバックオフして再送する。
-func (n *Notifier) Send(ctx context.Context, p webhookPayload) error {
-	p.Username = n.cfg.Username
-	p.AvatarURL = n.cfg.AvatarURL
-	p.AllowedMentions = &allowedMentions{Parse: []string{"users", "roles", "everyone"}}
-	body, err := json.Marshal(p)
-	if err != nil {
-		return err
-	}
-
+func (n *Notifier) Send(ctx context.Context, m message) error {
 	start := time.Now()
 	backoff := 2 * time.Second
 	for attempt := 1; ; attempt++ {
-		wait, err := n.post(ctx, body)
+		wait, err := n.tr.send(ctx, m)
 		if err == nil {
 			return nil
 		}
@@ -257,7 +274,7 @@ func (n *Notifier) Send(ctx context.Context, p webhookPayload) error {
 			wait = backoff
 			backoff = min(backoff*2, time.Minute)
 		}
-		slog.Warn("discord webhook failed, retrying", "attempt", attempt, "wait", wait, "err", err)
+		slog.Warn("discord send failed, retrying", "attempt", attempt, "wait", wait, "err", err)
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf("%w (gave up: %v)", err, ctx.Err())
@@ -268,14 +285,33 @@ func (n *Notifier) Send(ctx context.Context, p webhookPayload) error {
 
 type permanentError struct{ error }
 
-func (n *Notifier) post(ctx context.Context, body []byte) (retryAfter time.Duration, err error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, n.cfg.WebhookURL, bytes.NewReader(body))
+type webhookTransport struct {
+	cfg    DiscordConfig
+	client *http.Client
+}
+
+func newWebhookTransport(cfg DiscordConfig) *webhookTransport {
+	return &webhookTransport{cfg: cfg, client: &http.Client{Timeout: 15 * time.Second}}
+}
+
+func (w *webhookTransport) send(ctx context.Context, m message) (retryAfter time.Duration, err error) {
+	body, err := json.Marshal(webhookBody{
+		Content:         m.Content,
+		Username:        w.cfg.Username,
+		AvatarURL:       w.cfg.AvatarURL,
+		Embeds:          m.Embeds,
+		AllowedMentions: &allowedMentions{Parse: []string{"users", "roles", "everyone"}},
+	})
+	if err != nil {
+		return 0, permanentError{err}
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, w.cfg.WebhookURL, bytes.NewReader(body))
 	if err != nil {
 		return 0, permanentError{err}
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "pingcord/"+version)
-	resp, err := n.client.Do(req)
+	resp, err := w.client.Do(req)
 	if err != nil {
 		return 0, err
 	}

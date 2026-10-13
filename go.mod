@@ -7,4 +7,9 @@ require (
 	gopkg.in/yaml.v3 v3.0.1
 )
 
-require golang.org/x/sys v0.49.0 // indirect
+require (
+	github.com/bwmarrin/discordgo v0.29.0 // indirect
+	github.com/gorilla/websocket v1.4.2 // indirect
+	golang.org/x/crypto v0.58.0 // indirect
+	golang.org/x/sys v0.49.0 // indirect
+)

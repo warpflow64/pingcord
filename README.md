@@ -1,6 +1,7 @@
 # pingcord
 
-MGMT 機器 (スイッチ、AP、WLC など) の死活を監視し、落ちたら Discord Webhook に通知する小さな監視ツールです。
+MGMT 機器 (スイッチ、AP、WLC など) の死活を監視し、落ちたら Discord に通知する小さな監視ツールです。
+通知は Webhook (送るだけ) と Bot (`/status` コマンドと ack ボタンつき) のどちらでも送れます。
 VyOS の `container` 機能で動かすことを前提に、静的バイナリ 1 つ (イメージ約 4MB) で動きます。
 
 - **blackbox 的な監視**: ICMP (ping) / TCP ポート / HTTP(S) を定期チェック
@@ -23,6 +24,48 @@ VyOS の `container` 機能で動かすことを前提に、静的バイナリ 1
 | 📊 定期レポート | UP / DOWN 件数とダウン中の一覧 |
 
 時刻は Discord のタイムスタンプ記法なので、見る人のローカル時刻と「5 分前」のような相対表示になります。
+
+## Webhook モードと Bot モード
+
+| | Webhook | Bot |
+|---|---|---|
+| 準備 | チャンネル設定で URL を発行するだけ | Developer Portal でアプリを作成し、サーバーに招待 |
+| DOWN / 復旧の通知 | ○ | ○ |
+| `/status` で今の状態を見る | × | ○ |
+| ack ボタン (確認済みにして再通知を止める) | × | ○ |
+| 復旧通知を元の DOWN 通知への返信にする | × | ○ |
+
+`discord.bot_token` (または環境変数 `DISCORD_BOT_TOKEN`) が設定されていれば Bot モード、なければ Webhook モードで動きます。
+
+### Bot モードの動き
+
+- DOWN / STILL DOWN の通知に **✋ Ack** ボタンが付きます。押すとボタンが「✅ 対象名 — 押した人」に変わり、その障害が復旧するまで STILL DOWN の再通知が止まります
+- 復旧すると、ボタンが「🟢 復旧」に変わり、復旧通知は元の DOWN 通知への返信として投稿されます (ack した人も表示)
+- `/status` で全対象の状態を表示します。既定は自分にだけ見える表示で、`share: True` でチャンネル全員に表示します
+- ack は「どの障害に対するものか」を記録しているので、前回のダウン時の古いボタンで新しいダウンを ack することはありません
+- ack の状態はメモリ上だけなので、pingcord を再起動すると消えます
+- Discord とは外向きの WebSocket で接続するので、VyOS 側でポートを開ける必要はありません
+
+### Bot の作成
+
+1. <https://discord.com/developers/applications> で **New Application** を作成
+2. **Bot** タブで **Reset Token** を押してトークンを控える (特権 Intent はどれも不要)
+3. 以下の URL の `APP_ID` を **General Information** の Application ID に置き換えて開き、サーバーに招待
+
+   ```
+   https://discord.com/oauth2/authorize?client_id=APP_ID&scope=bot%20applications.commands&permissions=216064
+   ```
+
+   権限は「チャンネルを見る」「メッセージを送信」「埋め込みリンク」「メッセージ履歴を読む」「@everyone/@here/全てのロールにメンション」です。
+4. Discord の設定 → 詳細設定 → **開発者モード** をオンにし、通知先チャンネルとサーバーを右クリックして ID をコピー
+5. `config.yaml` に `channel_id` と `guild_id` を書き、トークンは VyOS の environment で渡す
+
+   ```
+   set container name pingcord environment DISCORD_BOT_TOKEN value 'xxxxxxxx'
+   ```
+
+`guild_id` を省略すると `/status` はグローバルコマンドとして登録されます (使えるようになるまで少し時間がかかることがあります)。
+トークンが間違っている場合は起動時にエラーで終了します。
 
 ## 判定の仕組み
 
@@ -98,7 +141,7 @@ Webhook URL は `config.yaml` に直接書いても構いません (環境変数
 
 ```sh
 sudo podman exec pingcord /pingcord -check   # 設定の検証
-sudo podman exec pingcord /pingcord -test    # Discord にテスト通知 (メンションも確認できます)
+sudo podman exec pingcord /pingcord -test    # Discord にテスト通知 (メンションも確認できます。Bot モードでも可)
 sudo podman logs -f pingcord               # ログ
 show container
 ```

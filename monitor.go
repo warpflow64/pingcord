@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -44,6 +46,7 @@ type Event struct {
 	At          time.Time
 	DownSince   time.Time
 	RTT         time.Duration
+	AckedBy     string
 }
 
 type thresholds struct {
@@ -63,6 +66,39 @@ type probeState struct {
 	lastErr      string
 	lastRTT      time.Duration
 	lastCheck    time.Time
+	ackedBy      string
+	ackedAt      time.Time
+}
+
+var (
+	errUnknownTarget = errors.New("unknown target")
+	errNotDown       = errors.New("target is not down")
+	errStaleAlert    = errors.New("alert is for an earlier outage")
+)
+
+type alreadyAckedError struct {
+	by string
+	at time.Time
+}
+
+func (e *alreadyAckedError) Error() string { return fmt.Sprintf("already acked by %s", e.by) }
+
+// ack は DOWN 中のアラートを確認済みにし、復旧するまで STILL DOWN の再通知を止める。
+// downSince でどのダウンに対する ack かを確認し、古い通知のボタンで新しいダウンを ack しないようにする。
+func (s *probeState) ack(downSince int64, by string, now time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.status != StatusDown {
+		return errNotDown
+	}
+	if s.downSince.Unix() != downSince {
+		return errStaleAlert
+	}
+	if s.ackedBy != "" {
+		return &alreadyAckedError{by: s.ackedBy, at: s.ackedAt}
+	}
+	s.ackedBy, s.ackedAt = by, now
+	return nil
 }
 
 // record は 1 回のチェック結果を反映し、通知が必要なら Event (対象情報は未設定) を返す。
@@ -83,8 +119,9 @@ func (s *probeState) record(now time.Time, rtt time.Duration, err error, th thre
 		case StatusDown:
 			if s.okStreak >= th.recover {
 				s.status = StatusUp
-				ev := &Event{Kind: EventRecovered, At: now, DownSince: s.downSince, RTT: rtt, Err: s.lastErr}
+				ev := &Event{Kind: EventRecovered, At: now, DownSince: s.downSince, RTT: rtt, Err: s.lastErr, AckedBy: s.ackedBy}
 				s.lastErr = ""
+				s.ackedBy, s.ackedAt = "", time.Time{}
 				return ev
 			}
 		default:
@@ -101,7 +138,7 @@ func (s *probeState) record(now time.Time, rtt time.Duration, err error, th thre
 	s.failStreak++
 	switch s.status {
 	case StatusDown:
-		if th.repeat > 0 && now.Sub(s.lastNotified) >= th.repeat {
+		if th.repeat > 0 && s.ackedBy == "" && now.Sub(s.lastNotified) >= th.repeat {
 			s.lastNotified = now
 			return &Event{Kind: EventStillDown, At: now, DownSince: s.downSince, Err: s.lastErr}
 		}
@@ -126,12 +163,13 @@ type TargetStatus struct {
 	LastError   string     `json:"last_error,omitempty"`
 	RTTMillis   float64    `json:"rtt_ms,omitempty"`
 	LastCheck   *time.Time `json:"last_check,omitempty"`
+	AckedBy     string     `json:"acked_by,omitempty"`
 }
 
 func (s *probeState) snapshot() TargetStatus {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	ts := TargetStatus{Status: s.status.String(), LastError: s.lastErr}
+	ts := TargetStatus{Status: s.status.String(), LastError: s.lastErr, AckedBy: s.ackedBy}
 	if s.status == StatusDown {
 		t := s.downSince
 		ts.DownSince = &t
@@ -230,6 +268,40 @@ func (m *Monitor) Snapshot() []TargetStatus {
 		out = append(out, ts)
 	}
 	return out
+}
+
+func (m *Monitor) state(name string) *probeState {
+	for _, mt := range m.targets {
+		if mt.target.Name == name {
+			return &mt.state
+		}
+	}
+	return nil
+}
+
+// Registry は ping 監視と deadman をまとめて名前で引けるようにする (/status と ack 用)。
+type Registry struct {
+	monitor *Monitor
+	deadman *Deadman
+}
+
+func (r *Registry) Snapshot() []TargetStatus {
+	return append(r.monitor.Snapshot(), r.deadman.Snapshot()...)
+}
+
+func (r *Registry) Ack(name string, downSince int64, by string) error {
+	st := r.monitor.state(name)
+	if st == nil {
+		st = r.deadman.state(name)
+	}
+	if st == nil {
+		return errUnknownTarget
+	}
+	if err := st.ack(downSince, by, time.Now()); err != nil {
+		return err
+	}
+	slog.Info("alert acked", "target", name, "by", by)
+	return nil
 }
 
 func logEvent(ev *Event) {

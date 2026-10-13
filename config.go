@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -25,9 +26,19 @@ type Config struct {
 }
 
 type DiscordConfig struct {
+	// Webhook モード
 	WebhookURL string `yaml:"webhook_url"`
 	Username   string `yaml:"username"`
 	AvatarURL  string `yaml:"avatar_url"`
+
+	// Bot モード (bot_token を設定すると Webhook より優先。/status と ack ボタンが使える)
+	BotToken  string `yaml:"bot_token"`
+	ChannelID string `yaml:"channel_id"`
+	// 設定するとこのサーバーにだけ /status を登録する (即時反映)。空ならグローバル登録
+	GuildID string `yaml:"guild_id"`
+	// 設定するとこれらのロールを持つメンバーだけが ack できる
+	AckRoles []string `yaml:"ack_roles"`
+
 	// DOWN 通知時に本文へ付けるメンション (例: "<@&ROLE_ID>", "@here")
 	Mention string `yaml:"mention"`
 }
@@ -91,6 +102,8 @@ type Target struct {
 	InsecureSkipVerify bool `yaml:"insecure_skip_verify"`
 }
 
+func (d *DiscordConfig) BotMode() bool { return d.BotToken != "" }
+
 func (t *Target) Address() string {
 	if t.Type == "http" {
 		return t.URL
@@ -117,6 +130,9 @@ func loadConfig(path string) (*Config, error) {
 	}
 	if c.Discord.WebhookURL == "" {
 		c.Discord.WebhookURL = os.Getenv("DISCORD_WEBHOOK_URL")
+	}
+	if c.Discord.BotToken == "" {
+		c.Discord.BotToken = os.Getenv("DISCORD_BOT_TOKEN")
 	}
 	c.applyDefaults()
 	if err := c.validate(); err != nil {
@@ -186,8 +202,24 @@ func (c *Config) validate() error {
 	var errs []error
 	add := func(format string, args ...any) { errs = append(errs, fmt.Errorf(format, args...)) }
 
-	if c.Discord.WebhookURL == "" {
-		add("discord.webhook_url (or DISCORD_WEBHOOK_URL) is required")
+	isSnowflake := func(s string) bool {
+		_, err := strconv.ParseUint(s, 10, 64)
+		return err == nil
+	}
+	if c.Discord.BotMode() {
+		if !isSnowflake(c.Discord.ChannelID) {
+			add("discord.channel_id is required in bot mode (numeric channel ID)")
+		}
+		if c.Discord.GuildID != "" && !isSnowflake(c.Discord.GuildID) {
+			add("discord.guild_id must be a numeric server ID")
+		}
+		for _, r := range c.Discord.AckRoles {
+			if !isSnowflake(r) {
+				add("discord.ack_roles: %q is not a numeric role ID", r)
+			}
+		}
+	} else if c.Discord.WebhookURL == "" {
+		add("discord.webhook_url (DISCORD_WEBHOOK_URL) or discord.bot_token (DISCORD_BOT_TOKEN) is required")
 	} else if u, err := url.Parse(c.Discord.WebhookURL); err != nil || (u.Scheme != "https" && u.Scheme != "http") {
 		add("discord.webhook_url is not a valid URL")
 	}

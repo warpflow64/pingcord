@@ -95,6 +95,13 @@ func (d *Deadman) emit(e *deadmanEntry, ev *Event) {
 	d.notify(*ev)
 }
 
+func (d *Deadman) state(name string) *probeState {
+	if e, ok := d.entries[name]; ok {
+		return &e.state
+	}
+	return nil
+}
+
 func (d *Deadman) Snapshot() []TargetStatus {
 	out := make([]TargetStatus, 0, len(d.order))
 	for _, e := range d.order {

@@ -2,8 +2,16 @@
 # ${VAR} は起動時に環境変数で置き換えられます (VyOS の container environment で渡せます)
 
 discord:
+  # --- Webhook モード: 通知を送るだけ ---
   webhook_url: ${DISCORD_WEBHOOK_URL}
   username: pingcord
+
+  # --- Bot モード: /status コマンドと ack ボタンが使える (bot_token があれば Webhook より優先) ---
+  # bot_token: ${DISCORD_BOT_TOKEN}
+  # channel_id: "123456789012345678"    # 通知を送るチャンネル
+  # guild_id: "123456789012345678"      # 指定するとこのサーバーに /status を即時登録 (省略時はグローバル登録)
+  # ack_roles: ["123456789012345678"]   # 指定するとこのロールを持つ人だけが ack できる
+
   # DOWN / STILL DOWN 通知時のメンション。ロールは "<@&ロールID>"、ユーザーは "<@ユーザーID>"、"@here" なども可
   mention: "@here"
 

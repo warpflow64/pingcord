@@ -41,7 +41,31 @@ func main() {
 		return
 	}
 
-	notifier := NewNotifier(cfg.Discord, cfg.Notify.GroupWait)
+	monitor := NewMonitor(cfg, nil)
+	deadman := NewDeadman(cfg, nil)
+	reg := &Registry{monitor: monitor, deadman: deadman}
+
+	var tr transport = newWebhookTransport(cfg.Discord)
+	var bot *Bot
+	if cfg.Discord.BotMode() {
+		if bot, err = NewBot(cfg.Discord, reg); err != nil {
+			slog.Error("discord bot", "err", err)
+			os.Exit(1)
+		}
+		tr = bot
+	}
+	if bot != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		err := bot.CheckToken(ctx)
+		cancel()
+		if err != nil {
+			slog.Error("discord bot", "err", err)
+			os.Exit(1)
+		}
+	}
+	notifier := NewNotifier(tr, cfg.Notify.GroupWait)
+	monitor.notify, deadman.notify = notifier.Notify, notifier.Notify
+
 	if *testNotify {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
@@ -53,13 +77,13 @@ func main() {
 		return
 	}
 
-	if err := run(cfg, notifier); err != nil {
+	if err := run(cfg, notifier, reg, bot); err != nil {
 		slog.Error("fatal", "err", err)
 		os.Exit(1)
 	}
 }
 
-func run(cfg *Config, notifier *Notifier) error {
+func run(cfg *Config, notifier *Notifier, reg *Registry, bot *Bot) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -72,8 +96,7 @@ func run(cfg *Config, notifier *Notifier) error {
 		conn.Close()
 	}
 
-	monitor := NewMonitor(cfg, notifier.Notify)
-	deadman := NewDeadman(cfg, notifier.Notify)
+	monitor, deadman := reg.monitor, reg.deadman
 
 	var wg sync.WaitGroup
 	start := func(f func(context.Context)) {
@@ -100,14 +123,16 @@ func run(cfg *Config, notifier *Notifier) error {
 	}
 
 	slog.Info("pingcord started", "version", version, "targets", len(cfg.Targets), "deadman", len(cfg.Deadman))
+	if bot != nil {
+		start(bot.Run)
+	}
 	start(monitor.Run)
 	start(deadman.Run)
 	if cfg.Heartbeat.URL != "" {
 		start(func(ctx context.Context) { runHeartbeat(ctx, cfg.Heartbeat) })
 	}
 	if len(cfg.Notify.SummaryAt) > 0 {
-		snapshot := func() []TargetStatus { return append(monitor.Snapshot(), deadman.Snapshot()...) }
-		start(func(ctx context.Context) { runSummary(ctx, cfg.Notify.SummaryAt, snapshot, notifier.Post) })
+		start(func(ctx context.Context) { runSummary(ctx, cfg.Notify.SummaryAt, reg.Snapshot, notifier.Post) })
 	}
 
 	<-ctx.Done()
