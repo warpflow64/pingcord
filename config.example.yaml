@@ -1,0 +1,77 @@
+# pingcord 設定例
+# ${VAR} は起動時に環境変数で置き換えられます (VyOS の container environment で渡せます)
+
+discord:
+  webhook_url: ${DISCORD_WEBHOOK_URL}
+  username: pingcord
+  # DOWN / STILL DOWN 通知時のメンション。ロールは "<@&ロールID>"、ユーザーは "<@ユーザーID>"、"@here" なども可
+  mention: "@here"
+
+# 各ターゲットで省略した項目に使われる値
+defaults:
+  interval: 30s          # チェック間隔
+  timeout: 2s            # 1 回のチェックのタイムアウト (interval 以下)
+  fail_threshold: 3      # 連続この回数失敗したら DOWN 通知 (30s x 3 = 約 1.5 分で検知)
+  recover_threshold: 2   # DOWN 中に連続この回数成功したら RECOVERED 通知
+  repeat_interval: 1h    # DOWN が続く間、この間隔で STILL DOWN を再通知 (0s で無効)
+  icmp_count: 3          # 1 回のチェックで送る ping の数 (1 つでも返れば成功)
+
+notify:
+  group_wait: 10s        # この間に起きたイベントを 1 メッセージにまとめる (スイッチ断で配下が一斉に落ちたとき用)
+  startup: true          # 起動時に通知
+  shutdown: true         # 停止時に通知
+  summary_at: ["09:00"]  # 毎日この時刻に全体の状態をレポート (TZ 環境変数のタイムゾーン)
+
+# 外部の deadman サービスへのハートビート (任意)
+# VyOS 自体や回線が落ちると pingcord は Discord に通知できないため、
+# healthchecks.io や Uptime Kuma (Push モニター) で「ハートビートが途絶えたら通知」を設定しておくと安心です。
+heartbeat:
+  url: ""                # 例: https://hc-ping.com/<uuid>
+  interval: 1m
+
+# /ping/<name> (deadman 用), /status, /healthz を提供する HTTP サーバー (任意)
+http:
+  listen: "127.0.0.1:9095"
+  token: ${PINGCORD_TOKEN}  # 設定すると /ping と /status に ?token= か Authorization: Bearer が必要
+
+# 機器やスクリプト側から定期的に /ping/<name> を叩いてもらい、途絶えたら DOWN とする監視 (任意)
+deadman:
+  - name: config-backup
+    timeout: 26h
+    description: "夜間の設定バックアップジョブ"
+
+targets:
+  # --- ICMP (ping) ---
+  - name: core-sw01
+    host: 10.255.0.2
+    description: "コアスイッチ (MDF)"
+    mention: "<@&123456789012345678>"   # 個別にメンション先を変える例
+
+  - name: dist-sw-1f
+    host: 10.255.0.11
+    description: "1F 配下 PoE スイッチ"
+
+  - name: ap-1f-01
+    host: 10.255.10.101
+    description: "1F ホール AP"
+    fail_threshold: 4                    # AP は再起動が多いので少し鈍感にする例
+    repeat_interval: 0s                  # この対象は再通知しない
+
+  - name: ap-1f-02
+    host: 10.255.10.102
+    description: "1F ロビー AP"
+    mention: none                        # この対象はメンションしない
+
+  # --- TCP ポート ---
+  - name: wlc-ssh
+    type: tcp
+    host: 10.255.0.20:22
+    description: "無線 LAN コントローラ SSH"
+
+  # --- HTTP(S) ---
+  - name: ap-controller-web
+    type: http
+    url: https://10.255.0.21:8443/
+    insecure_skip_verify: true           # 自己署名証明書の管理画面
+    timeout: 5s
+    description: "AP コントローラ Web UI"

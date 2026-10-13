@@ -1,0 +1,4 @@
+/pingcord
+*.tar
+# 実運用の設定 (Webhook URL などを含む)
+config.yaml
